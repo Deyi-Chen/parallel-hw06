@@ -6,86 +6,154 @@
 #include <algorithm>
 #include "ticktock.h"
 
+#include <tbb/tbb.h>
+
 // TODO: 并行化所有这些 for 循环
 
 template <class T, class Func>
-std::vector<T> fill(std::vector<T> &arr, Func const &func) {
+std::vector<T> fill(std::vector<T> &arr, Func const &func)
+{
     TICK(fill);
-    for (size_t i = 0; i < arr.size(); i++) {
-        arr[i] = func(i);
-    }
+    tbb::parallel_for(
+        tbb::blocked_range<size_t>(0, arr.size()),
+        [&](tbb::blocked_range<size_t> r)
+        {
+            for (size_t i = r.begin(); i < r.end(); i++)
+            {
+                arr[i] = func(i);
+            }
+        });
     TOCK(fill);
     return arr;
 }
 
 template <class T>
-void saxpy(T a, std::vector<T> &x, std::vector<T> const &y) {
+void saxpy(T a, std::vector<T> &x, std::vector<T> const &y)
+{
     TICK(saxpy);
-    for (size_t i = 0; i < x.size(); i++) {
-       x[i] = a * x[i] + y[i];
-    }
+    tbb::parallel_for(
+        tbb::blocked_range<size_t>(0, x.size()),
+        [&](tbb::blocked_range<size_t> r)
+        {
+            for (size_t i = r.begin(); i < r.end(); i++)
+            {
+                x[i] = a * x[i] + y[i];
+            }
+        });
     TOCK(saxpy);
 }
 
 template <class T>
-T sqrtdot(std::vector<T> const &x, std::vector<T> const &y) {
+T sqrtdot(std::vector<T> const &x, std::vector<T> const &y)
+{
     TICK(sqrtdot);
-    T ret = 0;
-    for (size_t i = 0; i < std::min(x.size(), y.size()); i++) {
-        ret += x[i] * y[i];
-    }
+    // parallel_reduce(range, identity, body, combiner)
+    T ret = tbb::parallel_reduce(
+        tbb::blocked_range<size_t>(0, std::min(x.size(), y.size())),
+        T(0),
+        [&](tbb::blocked_range<size_t> r, T local) { // T local is local accumulator for every thread
+            for (size_t i = r.begin(); i < r.end(); i++)
+            {
+                local += x[i] * y[i];
+            }
+            return local;
+        },
+        std::plus<T>());
     ret = std::sqrt(ret);
     TOCK(sqrtdot);
     return ret;
 }
 
 template <class T>
-T minvalue(std::vector<T> const &x) {
+T minvalue(std::vector<T> const &x)
+{
     TICK(minvalue);
-    T ret = x[0];
-    for (size_t i = 1; i < x.size(); i++) {
-        if (x[i] < ret)
-            ret = x[i];
-    }
+    T ret = tbb::parallel_reduce(
+        tbb::blocked_range<size_t>(0, x.size()),
+        std::numeric_limits<T>::max(), // set to infinity
+        [&](tbb::blocked_range<size_t> r, T local)
+        {
+            for (size_t i = r.begin(); i < r.end(); i++)
+            {
+                if (x[i] < local)
+                {
+                    local = x[i];
+                }
+            }
+            return local;
+        },
+        [](T a, T b)
+        { return std::min(a, b); });
     TOCK(minvalue);
     return ret;
 }
 
 template <class T>
-std::vector<T> magicfilter(std::vector<T> const &x, std::vector<T> const &y) {
+std::vector<T> magicfilter(std::vector<T> const &x, std::vector<T> const &y)
+{
     TICK(magicfilter);
     std::vector<T> res;
-    for (size_t i = 0; i < std::min(x.size(), y.size()); i++) {
-        if (x[i] > y[i]) {
-            res.push_back(x[i]);
-        } else if (y[i] > x[i] && y[i] > 0.5f) {
-            res.push_back(y[i]);
-            res.push_back(x[i] * y[i]);
-        }
-    }
+    std::mutex mtx;
+    tbb::parallel_for(
+        tbb::blocked_range<size_t>(0, std::min(x.size(), y.size())),
+        [&](tbb::blocked_range<size_t> r)
+        {
+            std::vector<T> local;
+            local.reserve(r.size()*2);
+            for (size_t i = r.begin(); i < r.end(); i++)
+            {
+                if (x[i] > y[i])
+                {
+                    local.push_back(x[i]);
+                }
+                else if (y[i] > x[i] && y[i] > 0.5f)
+                {
+                    local.push_back(y[i]);
+                    local.push_back(x[i] * y[i]);
+                }
+            }
+            std::lock_guard<std::mutex> lock(mtx);
+            res.insert(res.end(), local.begin(), local.end());
+        });
     TOCK(magicfilter);
     return res;
 }
 
 template <class T>
-T scanner(std::vector<T> &x) {
+T scanner(std::vector<T> &x)
+{
     TICK(scanner);
-    T ret = 0;
-    for (size_t i = 0; i < x.size(); i++) {
-        ret += x[i];
-        x[i] = ret;
-    }
+    T ret=tbb::parallel_scan(
+        tbb::blocked_range<size_t>(0, x.size()),
+        T(0),
+        [&](tbb::blocked_range<size_t> r, T sum, bool is_final)
+        {
+            T tmp = sum;
+            for (size_t i = r.begin(); i < r.end(); i++)
+            {
+                tmp += x[i];
+                if (is_final)
+                    x[i] = tmp;
+            }
+            return tmp;
+        },
+        std::plus<T>()
+    );
     TOCK(scanner);
     return ret;
 }
 
-int main() {
-    size_t n = 1<<26;
+
+int main()
+{
+    size_t n = 1 << 26;
     std::vector<float> x(n);
     std::vector<float> y(n);
 
-    fill(x, [&] (size_t i) { return std::sin(i); });
-    fill(y, [&] (size_t i) { return std::cos(i); });
+    fill(x, [&](size_t i)
+         { return std::sin(i); });
+    fill(y, [&](size_t i)
+         { return std::cos(i); });
 
     saxpy(0.5f, x, y);
 
